@@ -1,1 +1,250 @@
+# EduCRM Desktop — Upgraded (Полная версия с выбором курсов)
+# Зависимости: PyQt6, pandas, matplotlib, openpyxl
+# Run: python crm_desktop_upgraded.py
 
+import sys, os, sqlite3
+from PyQt6 import QtWidgets
+from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
+                             QListWidget, QListWidgetItem, QLabel, QDialog, QFormLayout, QLineEdit, QTextEdit,
+                             QDateEdit, QTableWidget, QTableWidgetItem, QFileDialog, QMessageBox, QListWidgetItem,
+                             QAbstractItemView)
+from PyQt6.QtCore import Qt, QDate
+import pandas as pd
+
+BASE_DIR = os.path.dirname(__file__)
+DB_PATH = os.path.join(BASE_DIR, 'crm_data.db')
+os.makedirs(os.path.join(BASE_DIR,'backups'), exist_ok=True)
+
+# -------------------- DB --------------------
+def get_conn():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def init_db():
+    conn=get_conn(); cur=conn.cursor()
+    cur.executescript("""
+CREATE TABLE IF NOT EXISTS students (id INTEGER PRIMARY KEY, first_name TEXT, last_name TEXT, email TEXT UNIQUE, phone TEXT, date_of_birth TEXT, notes TEXT);
+CREATE TABLE IF NOT EXISTS courses (id INTEGER PRIMARY KEY, code TEXT UNIQUE, title TEXT, description TEXT, teacher_id INTEGER, price REAL, is_active INTEGER DEFAULT 1);
+CREATE TABLE IF NOT EXISTS student_courses (id INTEGER PRIMARY KEY, student_id INTEGER, course_id INTEGER);
+""")
+    conn.commit(); conn.close()
+
+# -------------------- Student Dialog --------------------
+class StudentDialog(QDialog):
+    def __init__(self, parent=None, data=None):
+        super().__init__(parent)
+        self.setWindowTitle("Добавить/Редактировать студента")
+        self.setMinimumWidth(500)
+        layout = QVBoxLayout(self)
+
+        form = QFormLayout()
+        self.first_name = QLineEdit(); form.addRow("Имя:", self.first_name)
+        self.last_name = QLineEdit(); form.addRow("Фамилия:", self.last_name)
+        self.email = QLineEdit(); form.addRow("Email:", self.email)
+        self.phone = QLineEdit(); form.addRow("Телефон:", self.phone)
+        self.dob = QDateEdit(); self.dob.setCalendarPopup(True); self.dob.setDate(QDate.currentDate()); form.addRow("Дата рождения:", self.dob)
+        self.notes = QTextEdit(); form.addRow("Заметки:", self.notes)
+
+        # Мультивыбор курсов
+        self.course_list = QListWidget()
+        self.course_list.setSelectionMode(QAbstractItemView.SelectionMode.MultiSelection)
+        conn = get_conn(); cur = conn.cursor(); cur.execute("SELECT id,title FROM courses"); courses = cur.fetchall(); conn.close()
+        self.course_map = {}  # title -> id
+        for c in courses:
+            item = QListWidgetItem(c['title']); self.course_list.addItem(item); self.course_map[c['title']] = c['id']
+        form.addRow("Курсы:", self.course_list)
+
+        layout.addLayout(form)
+        btns = QHBoxLayout(); save = QPushButton("Сохранить"); cancel = QPushButton("Отмена"); btns.addWidget(save); btns.addWidget(cancel)
+        layout.addLayout(btns)
+        save.clicked.connect(self.accept); cancel.clicked.connect(self.reject)
+
+        # Заполнение при редактировании
+        if data:
+            self.first_name.setText(data['first_name']); self.last_name.setText(data['last_name'])
+            self.email.setText(data['email']); self.phone.setText(data['phone'])
+            try: self.dob.setDate(QDate.fromString(data['date_of_birth'],"yyyy-MM-dd"))
+            except: pass
+            self.notes.setPlainText(data['notes'] or '')
+            student_id = data['id']
+            conn = get_conn(); cur = conn.cursor()
+            cur.execute("SELECT course_id FROM student_courses WHERE student_id=?", (student_id,))
+            enrolled = [r['course_id'] for r in cur.fetchall()]; conn.close()
+            for i in range(self.course_list.count()):
+                item = self.course_list.item(i)
+                if self.course_map[item.text()] in enrolled: item.setSelected(True)
+
+    def get_data(self):
+        selected_courses = [self.course_map[item.text()] for item in self.course_list.selectedItems()]
+        return {
+            'first_name': self.first_name.text(),
+            'last_name': self.last_name.text(),
+            'email': self.email.text(),
+            'phone': self.phone.text(),
+            'date_of_birth': self.dob.date().toString("yyyy-MM-dd"),
+            'notes': self.notes.toPlainText(),
+            'courses': selected_courses
+        }
+
+# -------------------- MainWindow --------------------
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("EduCRM Desktop — Admin")
+        self.resize(1200,760)
+        central = QWidget(); self.setCentralWidget(central)
+        root = QHBoxLayout(); central.setLayout(root)
+
+        # Left nav
+        self.nav = QListWidget(); self.nav.setFixedWidth(220)
+        for name in ["Дашборд","Студенты","Курсы","FAQ"]:  # минимальный набор
+            item = QListWidgetItem(name); item.setTextAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+            self.nav.addItem(item)
+        self.nav.currentRowChanged.connect(self.on_nav_change); root.addWidget(self.nav)
+
+        # Pages
+        self.pages = QtWidgets.QStackedWidget(); root.addWidget(self.pages,1)
+        self.pages.addWidget(self.page_dashboard())
+        self.pages.addWidget(self.page_students())
+        self.pages.addWidget(self.page_courses())
+        self.pages.addWidget(self.page_faq())
+        self.nav.setCurrentRow(0)
+
+    def on_nav_change(self, idx): self.pages.setCurrentIndex(idx)
+
+    # -------------------- Pages --------------------
+    def page_dashboard(self):
+        w = QWidget(); v = QVBoxLayout(); w.setLayout(v)
+        v.addWidget(QLabel("<h2>Добро пожаловать в EduCRM (Admin)</h2>"))
+        v.addWidget(QLabel("Меню слева: управление студентами и курсами."))
+        return w
+
+    # -------------------- Students --------------------
+    def page_students(self):
+        w = QWidget(); v = QVBoxLayout(); w.setLayout(v)
+        hb_top = QHBoxLayout(); self.search_input = QLineEdit(); self.search_input.setPlaceholderText("Поиск студентов...")
+        hb_top.addWidget(QLabel("🔍")); hb_top.addWidget(self.search_input)
+        self.search_input.textChanged.connect(self.load_students); v.addLayout(hb_top)
+
+        hb = QHBoxLayout(); add = QPushButton("Добавить"); edit = QPushButton("Ред."); delete = QPushButton("Удалить")
+        hb.addWidget(add); hb.addWidget(edit); hb.addWidget(delete); v.addLayout(hb)
+        add.clicked.connect(self.add_student); edit.clicked.connect(self.edit_student); delete.clicked.connect(self.delete_student)
+
+        self.students_table = QTableWidget(); self.students_table.setColumnCount(6)
+        self.students_table.setHorizontalHeaderLabels(["ID","Фамилия","Имя","Email","Телефон","Дата рождения"])
+        self.students_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        v.addWidget(self.students_table)
+        self.load_students(); return w
+
+    def load_students(self):
+        search_text = self.search_input.text().lower()
+        conn=get_conn(); cur=conn.cursor(); cur.execute("SELECT * FROM students ORDER BY last_name, first_name"); rows=cur.fetchall(); conn.close()
+        filtered = [r for r in rows if search_text in (r['first_name'] or '').lower() or search_text in (r['last_name'] or '').lower() or search_text in (r['email'] or '').lower() or search_text in (r['phone'] or '').lower()]
+        self.students_table.setRowCount(len(filtered))
+        for i,r in enumerate(filtered):
+            self.students_table.setItem(i,0,QTableWidgetItem(str(r['id'])))
+            self.students_table.setItem(i,1,QTableWidgetItem(r['last_name'] or ''))
+            self.students_table.setItem(i,2,QTableWidgetItem(r['first_name'] or ''))
+            self.students_table.setItem(i,3,QTableWidgetItem(r['email'] or ''))
+            self.students_table.setItem(i,4,QTableWidgetItem(r['phone'] or ''))
+            self.students_table.setItem(i,5,QTableWidgetItem(r['date_of_birth'] or ''))
+
+    def selected_student(self):
+        sel = self.students_table.selectedItems()
+        if not sel: return None
+        row = sel[0].row(); sid = int(self.students_table.item(row,0).text())
+        conn=get_conn(); cur=conn.cursor(); cur.execute("SELECT * FROM students WHERE id=?", (sid,)); s=cur.fetchone(); conn.close(); return s
+
+    def add_student(self):
+        dlg = StudentDialog(self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            d = dlg.get_data()
+            conn = get_conn(); cur = conn.cursor()
+            cur.execute("INSERT INTO students (first_name,last_name,email,phone,date_of_birth,notes) VALUES (?,?,?,?,?,?)",
+                        (d['first_name'], d['last_name'], d['email'], d['phone'], d['date_of_birth'], d['notes']))
+            student_id = cur.lastrowid
+            for cid in d['courses']:
+                cur.execute("INSERT INTO student_courses (student_id, course_id) VALUES (?,?)", (student_id, cid))
+            conn.commit(); conn.close(); self.load_students()
+
+    def edit_student(self):
+        s = self.selected_student()
+        if not s: QMessageBox.information(self,'Info','Выберите студента'); return
+        dlg = StudentDialog(self,s)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            d = dlg.get_data()
+            conn = get_conn(); cur = conn.cursor()
+            cur.execute("UPDATE students SET first_name=?,last_name=?,email=?,phone=?,date_of_birth=?,notes=? WHERE id=?",
+                        (d['first_name'], d['last_name'], d['email'], d['phone'], d['date_of_birth'], d['notes'], s['id']))
+            cur.execute("DELETE FROM student_courses WHERE student_id=?", (s['id'],))
+            for cid in d['courses']:
+                cur.execute("INSERT INTO student_courses (student_id, course_id) VALUES (?,?)", (s['id'], cid))
+            conn.commit(); conn.close(); self.load_students()
+
+    def delete_student(self):
+        s=self.selected_student()
+        if not s: QMessageBox.information(self,'Info','Выберите студента'); return
+        if QMessageBox.question(self,'Удалить','Удалить студента?')==QMessageBox.StandardButton.Yes:
+            conn=get_conn(); cur=conn.cursor(); cur.execute("DELETE FROM students WHERE id=?", (s['id'],)); cur.execute("DELETE FROM student_courses WHERE student_id=?", (s['id'],)); conn.commit(); conn.close(); self.load_students()
+
+    # -------------------- Courses --------------------
+    def page_courses(self):
+        w=QWidget(); v=QVBoxLayout(); w.setLayout(v)
+        hb=QHBoxLayout(); add=QPushButton("Добавить"); edit=QPushButton("Ред."); delete=QPushButton("Удалить"); hb.addWidget(add); hb.addWidget(edit); hb.addWidget(delete); v.addLayout(hb)
+        add.clicked.connect(self.add_course); edit.clicked.connect(self.edit_course); delete.clicked.connect(self.delete_course)
+        self.courses_table = QTableWidget(); self.courses_table.setColumnCount(2)
+        self.courses_table.setHorizontalHeaderLabels(["ID","Название"])
+        self.courses_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows); v.addWidget(self.courses_table)
+        self.load_courses(); return w
+
+    def load_courses(self):
+        conn=get_conn(); cur=conn.cursor(); cur.execute("SELECT * FROM courses ORDER BY title"); rows=cur.fetchall(); conn.close()
+        self.courses_table.setRowCount(len(rows))
+        for i,r in enumerate(rows):
+            self.courses_table.setItem(i,0,QTableWidgetItem(str(r['id'])))
+            self.courses_table.setItem(i,1,QTableWidgetItem(r['title']))
+
+    def selected_course(self):
+        sel = self.courses_table.selectedItems(); 
+        if not sel: return None
+        row = sel[0].row(); cid=int(self.courses_table.item(row,0).text())
+        conn=get_conn(); cur=conn.cursor(); cur.execute("SELECT * FROM courses WHERE id=?", (cid,)); c=cur.fetchone(); conn.close(); return c
+
+    def add_course(self):
+        text, ok = QtWidgets.QInputDialog.getText(self,"Добавить курс","Название курса:"); 
+        if ok and text.strip():
+            conn=get_conn(); cur=conn.cursor(); cur.execute("INSERT INTO courses (title) VALUES (?)",(text.strip(),)); conn.commit(); conn.close(); self.load_courses()
+
+    def edit_course(self):
+        c=self.selected_course()
+        if not c: QMessageBox.information(self,'Info','Выберите курс'); return
+        text, ok = QtWidgets.QInputDialog.getText(self,"Редактировать курс","Название курса:",text=c['title'])
+        if ok and text.strip():
+            conn=get_conn(); cur=conn.cursor(); cur.execute("UPDATE courses SET title=? WHERE id=?",(text.strip(),c['id'])); conn.commit(); conn.close(); self.load_courses()
+
+    def delete_course(self):
+        c=self.selected_course()
+        if not c: QMessageBox.information(self,'Info','Выберите курс'); return
+        if QMessageBox.question(self,'Удалить','Удалить курс?')==QMessageBox.StandardButton.Yes:
+            conn=get_conn(); cur=conn.cursor(); cur.execute("DELETE FROM courses WHERE id=?",(c['id'],)); cur.execute("DELETE FROM student_courses WHERE course_id=?",(c['id'],)); conn.commit(); conn.close(); self.load_courses()
+
+    # -------------------- FAQ --------------------
+    def page_faq(self):
+        w=QWidget(); v=QVBoxLayout(); w.setLayout(v)
+        faq_text = """
+<h2>Инструкция по работе с EduCRM</h2>
+<ul>
+<li><b>Студенты:</b> добавление, редактирование, удаление, поиск по ФИО/Email/Телефону, выбор курсов.</li>
+<li><b>Курсы:</b> добавление/редактирование/удаление курса.</li>
+<li><b>FAQ:</b> эта вкладка.</li>
+</ul>
+"""
+        lbl = QLabel(faq_text); lbl.setWordWrap(True); lbl.setTextFormat(Qt.TextFormat.RichText); v.addWidget(lbl)
+        return w
+
+# -------------------- Main --------------------
+if __name__=="__main__":
+    init_db(); app=QApplication(sys.argv)
+    win=MainWindow(); win.show()
+    sys.exit(app.exec())
